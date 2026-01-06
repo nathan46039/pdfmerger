@@ -1,12 +1,35 @@
 import streamlit as st
 import requests
 import io
+import concurrent.futures
 from pypdf import PdfWriter, PdfReader
 
 # --- Config ---
 st.set_page_config(page_title="ODOT Report Merger", page_icon="📄")
 BASE_URL = "https://hsip.dot.state.oh.us/api/report/"
 CHUNK_SIZE = 20
+
+# --- Helper Functions ---
+def fetch_page(doc_id):
+    """
+    Fetches a single document by ID and returns the first page.
+    Returns None if the fetch fails or the document is invalid.
+    """
+    url = f"{BASE_URL}{doc_id}"
+    try:
+        response = requests.get(url, timeout=10)
+        if response.status_code == 200:
+            pdf_file = io.BytesIO(response.content)
+            reader = PdfReader(pdf_file)
+            if len(reader.pages) > 0:
+                # Return the page object. 
+                # Note: The PdfReader and BytesIO stream must remain reachable 
+                # for the page to be valid, which Python's GC handles here 
+                # as long as the page is referenced.
+                return reader.pages[0]
+    except Exception:
+        pass
+    return None
 
 # --- UI Layout ---
 st.title("📄 ODOT Report Merger")
@@ -31,24 +54,30 @@ if st.button("Generate PDFs", type="primary"):
         valid_pages = []
         total = len(doc_ids)
 
-        # 1. Fetch all pages first
-        for i, doc_id in enumerate(doc_ids):
-            status_text.text(f"Fetching {doc_id} ({i+1}/{total})...")
-            url = f"{BASE_URL}{doc_id}"
+        # 1. Fetch pages in parallel
+        status_text.text(f"Starting parallel fetch for {total} documents...")
+        
+        # We use a list to keep track of futures to maintain order later
+        futures = []
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+            # Submit all tasks
+            for doc_id in doc_ids:
+                future = executor.submit(fetch_page, doc_id)
+                futures.append(future)
             
-            try:
-                response = requests.get(url, timeout=10)
-                if response.status_code == 200:
-                    pdf_file = io.BytesIO(response.content)
-                    reader = PdfReader(pdf_file)
-                    if len(reader.pages) > 0:
-                        # Store the page object (and implicitly its reader/data)
-                        valid_pages.append(reader.pages[0])
-            except Exception:
-                pass # Skip errors silently to keep UI clean
+            # Monitor progress as tasks complete
+            completed_count = 0
+            for _ in concurrent.futures.as_completed(futures):
+                completed_count += 1
+                progress_bar.progress(completed_count / total)
+                status_text.text(f"Fetching documents... ({completed_count}/{total})")
             
-            # Update progress
-            progress_bar.progress((i + 1) / total)
+            # Collect results in the original order
+            for future in futures:
+                result = future.result()
+                if result:
+                    valid_pages.append(result)
 
         # 2. Process and Split
         if not valid_pages:
