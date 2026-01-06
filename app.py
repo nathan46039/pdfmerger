@@ -6,16 +6,17 @@ from pypdf import PdfWriter, PdfReader
 # --- Config ---
 st.set_page_config(page_title="ODOT Report Merger", page_icon="📄")
 BASE_URL = "https://hsip.dot.state.oh.us/api/report/"
+CHUNK_SIZE = 20
 
 # --- UI Layout ---
 st.title("📄 ODOT Report Merger")
-st.markdown("Enter document numbers below to merge the first page of each report into a single PDF.")
+st.markdown(f"Enter document numbers below. The tool will merge the first page of each report and break the result into **{CHUNK_SIZE}-page PDF chunks**.")
 
 # Input Area
 raw_input = st.text_area("Document Numbers", height=200, placeholder="10234\n10235\n10236")
 
 # Logic
-if st.button("Generate PDF", type="primary"):
+if st.button("Generate PDFs", type="primary"):
     if not raw_input.strip():
         st.error("Please enter at least one document number.")
     else:
@@ -25,15 +26,14 @@ if st.button("Generate PDF", type="primary"):
         
         # Parse IDs
         doc_ids = [line.strip() for line in raw_input.replace(',', '\n').split('\n') if line.strip()]
-        doc_ids = doc_ids[:300] # Limit to 300
+        doc_ids = doc_ids[:300] # Limit to 300 to prevent timeouts
         
-        merger = PdfWriter()
-        success_count = 0
+        valid_pages = []
         total = len(doc_ids)
 
-        # Loop
+        # 1. Fetch all pages first
         for i, doc_id in enumerate(doc_ids):
-            status_text.text(f"Processing {doc_id} ({i+1}/{total})...")
+            status_text.text(f"Fetching {doc_id} ({i+1}/{total})...")
             url = f"{BASE_URL}{doc_id}"
             
             try:
@@ -42,26 +42,71 @@ if st.button("Generate PDF", type="primary"):
                     pdf_file = io.BytesIO(response.content)
                     reader = PdfReader(pdf_file)
                     if len(reader.pages) > 0:
-                        merger.add_page(reader.pages[0])
-                        success_count += 1
+                        # Store the page object (and implicitly its reader/data)
+                        valid_pages.append(reader.pages[0])
             except Exception:
                 pass # Skip errors silently to keep UI clean
             
             # Update progress
             progress_bar.progress((i + 1) / total)
 
-        # Finalize
-        if success_count > 0:
-            output_buffer = io.BytesIO()
-            merger.write(output_buffer)
-            pdf_bytes = output_buffer.getvalue()
-            
-            st.success(f"Done! {success_count} reports merged.")
-            st.download_button(
-                label="Download Final PDF",
-                data=pdf_bytes,
-                file_name="merged_reports.pdf",
-                mime="application/pdf"
-            )
-        else:
+        # 2. Process and Split
+        if not valid_pages:
             st.error("No valid documents were found.")
+            status_text.empty()
+        else:
+            status_text.text("Finalizing chunks...")
+            st.success(f"Done! Found {len(valid_pages)} pages.")
+
+            # Option 1: Full Download
+            full_merger = PdfWriter()
+            for page in valid_pages:
+                full_merger.add_page(page)
+            
+            full_buffer = io.BytesIO()
+            full_merger.write(full_buffer)
+            full_bytes = full_buffer.getvalue()
+
+            st.download_button(
+                label="Download Complete PDF (All Pages)",
+                data=full_bytes,
+                file_name="merged_reports_full.pdf",
+                mime="application/pdf",
+                type="primary"
+            )
+            
+            st.divider()
+            st.subheader(f"Download by Chunk ({CHUNK_SIZE} Pages)")
+            
+            # Loop through pages in steps of CHUNK_SIZE
+            for chunk_index, i in enumerate(range(0, len(valid_pages), CHUNK_SIZE)):
+                chunk_pages = valid_pages[i : i + CHUNK_SIZE]
+                
+                # Create a writer for this specific chunk
+                merger = PdfWriter()
+                for page in chunk_pages:
+                    merger.add_page(page)
+                
+                output_buffer = io.BytesIO()
+                merger.write(output_buffer)
+                pdf_bytes = output_buffer.getvalue()
+                
+                # Calculate labels
+                start_num = i + 1
+                end_num = i + len(chunk_pages)
+                filename = f"merged_reports_{start_num}-{end_num}.pdf"
+                
+                # Display download button for this chunk
+                col1, col2 = st.columns([3, 1])
+                with col1:
+                    st.write(f"**Part {chunk_index + 1}:** Pages {start_num} to {end_num}")
+                with col2:
+                    st.download_button(
+                        label="Download PDF",
+                        data=pdf_bytes,
+                        file_name=filename,
+                        mime="application/pdf",
+                        key=f"btn_{chunk_index}"
+                    )
+            
+            status_text.empty()
