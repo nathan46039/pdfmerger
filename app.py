@@ -10,23 +10,25 @@ BASE_URL = "https://hsip.dot.state.oh.us/api/report/"
 CHUNK_SIZE = 20
 
 # --- Helper Functions ---
-def fetch_page(doc_id):
+def fetch_report_data(doc_id):
     """
-    Fetches a single document by ID and returns the first page.
+    Fetches a single document by ID and returns the raw BytesIO buffer.
     Returns None if the fetch fails or the document is invalid.
     """
     url = f"{BASE_URL}{doc_id}"
     try:
         response = requests.get(url, timeout=10)
         if response.status_code == 200:
-            pdf_file = io.BytesIO(response.content)
-            reader = PdfReader(pdf_file)
-            if len(reader.pages) > 0:
-                # Return the page object. 
-                # Note: The PdfReader and BytesIO stream must remain reachable 
-                # for the page to be valid, which Python's GC handles here 
-                # as long as the page is referenced.
-                return reader.pages[0]
+            pdf_data = io.BytesIO(response.content)
+            # Verify it's a valid PDF with at least one page
+            try:
+                reader = PdfReader(pdf_data)
+                if len(reader.pages) > 0:
+                    # Reset cursor to the beginning so it can be read again later
+                    pdf_data.seek(0)
+                    return pdf_data
+            except Exception:
+                pass # Invalid PDF structure
     except Exception:
         pass
     return None
@@ -51,10 +53,10 @@ if st.button("Generate PDFs", type="primary"):
         doc_ids = [line.strip() for line in raw_input.replace(',', '\n').split('\n') if line.strip()]
         doc_ids = doc_ids[:300] # Limit to 300 to prevent timeouts
         
-        valid_pages = []
+        valid_buffers = []
         total = len(doc_ids)
 
-        # 1. Fetch pages in parallel
+        # 1. Fetch data in parallel
         status_text.text(f"Starting parallel fetch for {total} documents...")
         
         # We use a list to keep track of futures to maintain order later
@@ -63,7 +65,7 @@ if st.button("Generate PDFs", type="primary"):
         with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
             # Submit all tasks
             for doc_id in doc_ids:
-                future = executor.submit(fetch_page, doc_id)
+                future = executor.submit(fetch_report_data, doc_id)
                 futures.append(future)
             
             # Monitor progress as tasks complete
@@ -77,20 +79,23 @@ if st.button("Generate PDFs", type="primary"):
             for future in futures:
                 result = future.result()
                 if result:
-                    valid_pages.append(result)
+                    valid_buffers.append(result)
 
         # 2. Process and Split
-        if not valid_pages:
+        if not valid_buffers:
             st.error("No valid documents were found.")
             status_text.empty()
         else:
             status_text.text("Finalizing chunks...")
-            st.success(f"Done! Found {len(valid_pages)} pages.")
+            st.success(f"Done! Found {len(valid_buffers)} pages.")
 
-            # Option 1: Full Download
+            # --- Option 1: Full Download ---
+            # We create a fresh reader for every operation to ensure thread/object safety
             full_merger = PdfWriter()
-            for page in valid_pages:
-                full_merger.add_page(page)
+            for buf in valid_buffers:
+                buf.seek(0)
+                reader = PdfReader(buf)
+                full_merger.add_page(reader.pages[0])
             
             full_buffer = io.BytesIO()
             full_merger.write(full_buffer)
@@ -107,14 +112,17 @@ if st.button("Generate PDFs", type="primary"):
             st.divider()
             st.subheader(f"Download by Chunk ({CHUNK_SIZE} Pages)")
             
-            # Loop through pages in steps of CHUNK_SIZE
-            for chunk_index, i in enumerate(range(0, len(valid_pages), CHUNK_SIZE)):
-                chunk_pages = valid_pages[i : i + CHUNK_SIZE]
+            # --- Option 2: Chunked Download ---
+            # Loop through buffers in steps of CHUNK_SIZE
+            for chunk_index, i in enumerate(range(0, len(valid_buffers), CHUNK_SIZE)):
+                chunk_buffers = valid_buffers[i : i + CHUNK_SIZE]
                 
                 # Create a writer for this specific chunk
                 merger = PdfWriter()
-                for page in chunk_pages:
-                    merger.add_page(page)
+                for buf in chunk_buffers:
+                    buf.seek(0) # Crucial: Reset buffer position before reading again
+                    reader = PdfReader(buf)
+                    merger.add_page(reader.pages[0])
                 
                 output_buffer = io.BytesIO()
                 merger.write(output_buffer)
@@ -122,7 +130,7 @@ if st.button("Generate PDFs", type="primary"):
                 
                 # Calculate labels
                 start_num = i + 1
-                end_num = i + len(chunk_pages)
+                end_num = i + len(chunk_buffers)
                 filename = f"merged_reports_{start_num}-{end_num}.pdf"
                 
                 # Display download button for this chunk
